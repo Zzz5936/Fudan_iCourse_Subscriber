@@ -7,6 +7,8 @@ import requests
 from io import BytesIO
 from PIL import Image
 from collections import OrderedDict
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -110,6 +112,31 @@ li { margin-bottom: 4px; }
 _MIN_INLINE_HEIGHT = 13  # minimum logical height for inline formulas (px)
 
 _IMAGE_CACHE: dict[str, tuple] = {}
+
+
+def _safe_filename(title: str) -> str:
+    """Sanitise a course title for use inside an attachment filename."""
+    return "".join(c if c.isalnum() or c in " _-" else "_" for c in title)[:80]
+
+
+def _course_markdown(course_title: str, lectures: list[dict]) -> str:
+    """Build the per-course Markdown attachment body.
+
+    Mirrors the structure of ``scripts/export_course.py::_build_plain`` so an
+    attachment from the daily email looks the same as a manual Markdown
+    export, except that it only contains the lectures included in this email
+    (i.e. the newly processed / re-summarised ones).
+    """
+    lines = [f"# 课程：{course_title}", ""]
+    for lec in lectures:
+        badge = "（更新）" if lec.get("is_update") else ""
+        lines.append(f"## {lec['sub_title']}{badge} ({lec['date']})")
+        lines.append("")
+        lines.append(lec.get("summary") or "")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _fetch_latex_image(url: str, dpi: int = 300) -> tuple:
@@ -289,6 +316,11 @@ class Emailer:
         the email via CID attachments, so they display on all clients
         (including mobile) without loading external images.
 
+        The email also carries one Markdown attachment per course (same
+        layout as ``scripts/export_course.py --md``, restricted to the
+        lectures in this email) so the summaries stay readable/archivable even
+        when a client blocks the inline formula images.
+
         Args:
             items: List of dicts, each with keys:
                    course_title, sub_title, date, summary
@@ -316,6 +348,7 @@ class Emailer:
         subject = f"[FiCS] {', '.join(parts)}"
         if any_update:
             subject += "（含 PPT 识别·更新）"
+        subject += "（含 Markdown 附件）"
 
         # Plain text (Markdown as-is, readable without rendering)
         plain_sections = []
@@ -385,27 +418,54 @@ class Emailer:
             + "</body></html>"
         )
 
-        # Build MIME: related > alternative > (plain, html) + image attachments
-        msg = MIMEMultipart("related")
+        # Per-course Markdown attachments (same layout as `Export Course
+        # Summaries` → Markdown, but limited to the lectures in this email).
+        md_attachments: list[tuple[str, bytes]] = [
+            (
+                f"{_safe_filename(course_title)}_summaries.md",
+                _course_markdown(course_title, lectures).encode("utf-8"),
+            )
+            for course_title, lectures in courses.items()
+        ]
+
+        # Build MIME: mixed > related > (alternative > plain, html) + CID images.
+        # Markdown files are siblings of the related part, so mail clients show
+        # them as real attachments while the HTML body keeps working.
+        msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
         msg["From"] = formataddr(("iCourse Subscriber", self.sender))
         msg["To"] = self.receiver
 
+        msg_related = MIMEMultipart("related")
         msg_alt = MIMEMultipart("alternative")
         msg_alt.attach(MIMEText(plain, "plain", "utf-8"))
         msg_alt.attach(MIMEText(html, "html", "utf-8"))
-        msg.attach(msg_alt)
+        msg_related.attach(msg_alt)
 
-        # Attach CID images
+        # Attach CID images (must live inside the related part)
         for cid, png_data in cid_images.items():
             img_part = MIMEImage(png_data, "png")
             img_part.add_header("Content-ID", f"<{cid}>")
             img_part.add_header("Content-Disposition", "inline",
                                 filename=f"{cid}.png")
-            msg.attach(img_part)
+            msg_related.attach(img_part)
+
+        msg.attach(msg_related)
+
+        # One Markdown attachment per course
+        for filename, md_bytes in md_attachments:
+            md_part = MIMEBase("text", "markdown")
+            md_part.set_payload(md_bytes)
+            encoders.encode_base64(md_part)
+            md_part.add_header(
+                "Content-Disposition", "attachment",
+                filename=("utf-8", "", filename),
+            )
+            msg.attach(md_part)
 
         if cid_images:
             print(f"[Emailer] Embedded {len(cid_images)} LaTeX images as CID")
+        print(f"[Emailer] Attached {len(md_attachments)} Markdown file(s)")
 
         # Retry with exponential backoff
         for attempt in range(3):
