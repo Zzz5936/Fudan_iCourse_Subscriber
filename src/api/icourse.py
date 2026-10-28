@@ -612,3 +612,151 @@ class ICourseClient:
         size_mb = downloaded / (1024 * 1024)
         print(f"    Downloaded: {size_mb:.1f}MB in {elapsed:.0f}s")
         return output_path
+
+    # ── Resumable media download (truncated-stream fallback) ──────────────
+
+    def download_lecture_media(
+        self,
+        course_id: str,
+        sub_id: str,
+        output_path: str,
+        max_attempts: int = 8,
+        chunk_size: int = 1 << 20,
+        timeout: int = 300,
+    ) -> str | None:
+        """Download a lecture's MP4 with HTTP Range resume + retries.
+
+        The iCourse CDN (through WebVPN) intermittently closes the
+        connection mid-file.  ffmpeg then exits cleanly on a partial stream,
+        and before this method existed the whole lecture was deferred to the
+        next day.  Here every attempt re-signs the URL and asks for
+        ``Range: bytes=<bytes already on disk>-``; a ``206 Partial Content``
+        appends to what we have instead of starting over.
+
+        The returned file is *not* validated against the media duration —
+        ``Transcriber.transcribe_video`` does the 90 % completeness check
+        once the file is local.
+
+        Returns ``output_path`` when the file looks complete, or ``None``
+        when no video URL is available / nothing could be downloaded.
+        """
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        expected: int | None = None
+        last_error = ""
+
+        for attempt in range(1, max_attempts + 1):
+            have = (
+                os.path.getsize(output_path)
+                if os.path.exists(output_path) else 0
+            )
+            if expected is not None and have >= expected:
+                break
+
+            try:
+                url = self.get_video_url(course_id, sub_id)
+            except Exception as e:                     # noqa: BLE001
+                url = None
+                last_error = f"{type(e).__name__}: {e}"
+            if not url:
+                # A fresh URL is required for every attempt; without one we
+                # cannot make progress.  Keep whatever bytes we already have
+                # and let the caller's ASR completeness check decide.
+                if have:
+                    break
+                print(f"    [Download] No video URL for {sub_id}",
+                      flush=True)
+                return None
+
+            vpn_url, _header_blob = self.get_stream_params(url)
+            headers: dict[str, str] = {}
+            if have:
+                headers["Range"] = f"bytes={have}-"
+
+            got = 0
+            resp = None
+            try:
+                resp = self.vpn.get_raw(
+                    vpn_url, stream=True, headers=headers, timeout=timeout,
+                )
+                status = resp.status_code
+                if status == 416:
+                    # Range not satisfiable: we already hold the whole file
+                    # (or the CDN wants a fresh start and has nothing to add).
+                    break
+                if status not in (200, 206):
+                    last_error = f"HTTP {status}"
+                    time.sleep(min(2 * attempt, 10))
+                    continue
+
+                if status == 200 and have:
+                    # The proxy ignored our Range header: start over rather
+                    # than appending a duplicate prefix to the file.
+                    have = 0
+                    os.remove(output_path)
+
+                if status == 200:
+                    total = resp.headers.get("Content-Length")
+                    expected = (
+                        int(total) if total and total.isdigit() else None
+                    )
+                else:
+                    m = re.search(
+                        r"/(\d+)\s*$", resp.headers.get("Content-Range", ""),
+                    )
+                    if m:
+                        expected = int(m.group(1))
+
+                with open(output_path, "ab" if have else "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            got += len(chunk)
+            except Exception as e:                     # noqa: BLE001
+                # Connection reset / ChunkedEncodingError: bytes received so
+                # far are already on disk, the next attempt resumes from there.
+                last_error = f"{type(e).__name__}: {e}"
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:                  # noqa: BLE001
+                        pass
+
+            size = (
+                os.path.getsize(output_path)
+                if os.path.exists(output_path) else 0
+            )
+            print(
+                f"    [Download] attempt {attempt}/{max_attempts}: "
+                f"+{got / 1024 / 1024:.1f} MB, total "
+                f"{size / 1024 / 1024:.1f} MB"
+                + (
+                    f" / {expected / 1024 / 1024:.1f} MB"
+                    if expected else ""
+                ),
+                flush=True,
+            )
+
+            if expected is not None and size >= expected:
+                break
+            if got == 0:
+                time.sleep(min(2 * attempt, 10))
+
+        size = (
+            os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        )
+        if not size:
+            print(f"    [Download] failed: {last_error or 'no data'}",
+                  flush=True)
+            return None
+        if expected is not None and size < expected:
+            print(
+                f"    [Download] incomplete after {max_attempts} attempts: "
+                f"{size} of {expected} bytes "
+                f"({last_error or 'stream truncated'})",
+                flush=True,
+            )
+            return None
+        print(f"    [Download] complete: {size / 1024 / 1024:.1f} MB",
+              flush=True)
+        return output_path

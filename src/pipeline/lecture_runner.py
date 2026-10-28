@@ -37,6 +37,7 @@ threads pick up refreshed cookies through the shared ``ICourseClient``.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -329,9 +330,25 @@ class LectureRunner:
             return None, None
         except IncompleteAudioError as e:
             # Truncated download (ffmpeg may even exit 0 on a server-side
-            # cut).  Don't persist the partial transcript — it would
-            # short-circuit the retry — just record the error so the
-            # lecture is retried up to max_errors times.
+            # cut).  Before deferring the lecture to a future run, try the
+            # two fallbacks that do not depend on the flaky live stream:
+            #   1. iCourse's own ASR transcript (no media download at all);
+            #   2. resumable HTTP download of the MP4 + local ffmpeg ASR.
+            self._reporter.info(
+                f"    [Fallback] Truncated audio ({e}); trying fallbacks "
+                f"before giving up..."
+            )
+            self._release_audio(sub_id)
+            recovered = self._recover_after_truncated_download(
+                course_id, sub_id,
+            )
+            if recovered is not None:
+                transcript, segments = recovered
+                self._db.update_transcript(sub_id, transcript)
+                return transcript, segments
+            # Don't persist the partial transcript — it would short-circuit
+            # the retry — just record the error so the lecture is retried
+            # up to max_errors times.
             self._reporter.info(
                 f"    [SKIP] Incomplete audio, will retry next run: {e}"
             )
@@ -348,6 +365,97 @@ class LectureRunner:
 
         self._db.update_transcript(sub_id, transcript)
         return transcript, segments
+
+    def _recover_after_truncated_download(
+        self, course_id: str, sub_id: str,
+    ) -> Optional[tuple[str, list]]:
+        """Last-resort transcript recovery after the live stream was cut.
+
+        The iCourse CDN occasionally truncates the MP4 part-way through the
+        lecture (ffmpeg then exits cleanly, so ``transcribe_tail`` raises
+        ``IncompleteAudioError``).  Two fallbacks are attempted, cheapest
+        first, and only for lectures that actually failed:
+
+          1. iCourse's own ASR transcript (``search-trans-result``).  When
+             the platform generated one and it is complete enough to pass
+             ``_official_transcript_usable`` this avoids downloading the
+             lecture's media altogether.
+          2. Resumable HTTP Range download of the MP4 with retries, then
+             local ffmpeg + ASR via ``Transcriber.transcribe_video``.
+
+        Returns ``(transcript, segments)`` on success, ``None`` when both
+        fallbacks are unavailable (caller keeps the original skip/retry
+        behaviour in that case).
+        """
+        duration_hint = self._db.get_max_ppt_created_sec(sub_id)
+
+        # ── 1. Official transcript (no download needed) ─────────────────
+        try:
+            official = self._client.get_transcript_segments(sub_id)
+            if self._official_transcript_usable(
+                    official, duration_hint_s=duration_hint):
+                text = " ".join(
+                    s["text"] for s in official if s.get("text")
+                )
+                self._reporter.info(
+                    f"    [Fallback] Using official iCourse transcript "
+                    f"({len(text)} chars, {len(official)} segments)"
+                )
+                return text, official
+            self._reporter.info(
+                "    [Fallback] Official transcript missing/incomplete — "
+                "switching to resumable media download..."
+            )
+        except Exception as e:                          # noqa: BLE001
+            self._reporter.info(
+                f"    [Fallback] Official transcript probe failed: "
+                f"{type(e).__name__}: {e} — switching to resumable "
+                f"media download..."
+            )
+
+        # ── 2. Resumable download + local ASR ───────────────────────────
+        media_path = os.path.join(config.AUDIO_DIR, f"{sub_id}.mp4")
+        try:
+            path = self._client.download_lecture_media(
+                course_id, sub_id, media_path,
+            )
+            if not path:
+                self._reporter.info(
+                    "    [Fallback] Resumable download did not produce a "
+                    "complete media file."
+                )
+                return None
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            self._reporter.info(
+                f"    [Fallback] Media downloaded ({size_mb:.0f} MB) — "
+                f"transcribing locally..."
+            )
+            transcript, segments = self._transcriber.transcribe_video(path)
+        except IncompleteAudioError as e:
+            self._reporter.info(
+                f"    [Fallback] Local ASR still incomplete: {e}"
+            )
+            return None
+        except Exception as e:                          # noqa: BLE001
+            self._reporter.info(
+                f"    [Fallback] Local ASR failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        finally:
+            self._remove_quietly(media_path)
+
+        if not transcript.strip():
+            return None
+        return transcript, segments
+
+    @staticmethod
+    def _remove_quietly(path: str) -> None:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
