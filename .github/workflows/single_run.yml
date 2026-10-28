@@ -16,6 +16,12 @@ on:
 permissions:
   contents: write
 
+# Same lock as check.yml: both workflows read-modify-write the data branch
+# via force-push, so they must never overlap.
+concurrency:
+  group: icourse-data
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
