@@ -1,4 +1,5 @@
 import re
+import os
 import smtplib
 import time
 import uuid
@@ -343,13 +344,6 @@ class Emailer:
         for item in items:
             courses.setdefault(item["course_title"], []).append(item)
 
-        # Subject
-        parts = [f"{ct} ({len(lecs)})" for ct, lecs in courses.items()]
-        subject = f"[FiCS] {', '.join(parts)}"
-        if any_update:
-            subject += "（含 PPT 识别·更新）"
-        subject += "（含 Markdown 附件）"
-
         # Plain text (Markdown as-is, readable without rendering)
         plain_sections = []
         for course_title, lectures in courses.items():
@@ -428,6 +422,51 @@ class Emailer:
             for course_title, lectures in courses.items()
         ]
 
+        # Per-lecture PPT decks: the deduplicated iCourse slide screenshots
+        # stitched by `src.pipeline.ppt_exporter` (optional, best-effort).
+        deck_attachments: list[tuple[str, str]] = []
+        seen_deck_paths: set[str] = set()
+        for item in items:
+            path = item.get("pptx_path")
+            if not path or path in seen_deck_paths or not os.path.exists(path):
+                continue
+            seen_deck_paths.add(path)
+            name = (
+                f"{_safe_filename(item['course_title'])}_"
+                f"{_safe_filename(item.get('sub_title') or item['sub_id'])}"
+                "_slides.pptx"
+            )
+            deck_attachments.append((name, path))
+
+        # QQ SMTP rejects oversized messages: keep the smaller decks when the
+        # budget is exhausted instead of failing the whole email.
+        attachment_budget = int(
+            config.EMAIL_MAX_ATTACHMENT_MB * 1024 * 1024
+        )
+        used_bytes = sum(len(b) for _, b in md_attachments)
+        kept_decks: list[tuple[str, str]] = []
+        for name, path in sorted(
+                deck_attachments, key=lambda d: os.path.getsize(d[1])):
+            size = os.path.getsize(path)
+            if used_bytes + size > attachment_budget:
+                print(f"[Emailer] Skipping deck {name} "
+                      f"({size / 1048576:.1f} MB): attachment budget "
+                      f"({config.EMAIL_MAX_ATTACHMENT_MB:.0f} MB) reached")
+                continue
+            kept_decks.append((name, path))
+            used_bytes += size
+
+        # Subject (built last so it only promises decks that survived the
+        # attachment-size guard above).
+        parts = [f"{ct} ({len(lecs)})" for ct, lecs in courses.items()]
+        subject = f"[FiCS] {', '.join(parts)}"
+        if any_update:
+            subject += "（含 PPT 识别·更新）"
+        if kept_decks:
+            subject += "（含 Markdown 附件 + PPT 课件）"
+        else:
+            subject += "（含 Markdown 附件）"
+
         # Build MIME: mixed > related > (alternative > plain, html) + CID images.
         # Markdown files are siblings of the related part, so mail clients show
         # them as real attachments while the HTML body keeps working.
@@ -466,6 +505,26 @@ class Emailer:
         if cid_images:
             print(f"[Emailer] Embedded {len(cid_images)} LaTeX images as CID")
         print(f"[Emailer] Attached {len(md_attachments)} Markdown file(s)")
+
+        # One slide deck per lecture (deduplicated iCourse PPT screenshots)
+        for filename, path in kept_decks:
+            with open(path, "rb") as deck_file:
+                deck_bytes = deck_file.read()
+            deck_part = MIMEBase(
+                "application",
+                "vnd.openxmlformats-officedocument.presentationml."
+                "presentation",
+            )
+            deck_part.set_payload(deck_bytes)
+            encoders.encode_base64(deck_part)
+            deck_part.add_header(
+                "Content-Disposition", "attachment",
+                filename=("utf-8", "", filename),
+            )
+            msg.attach(deck_part)
+        if kept_decks:
+            print(f"[Emailer] Attached {len(kept_decks)} slide deck(s), "
+                  f"total attachments {used_bytes / 1048576:.1f} MB")
 
         # Retry with exponential backoff
         for attempt in range(3):

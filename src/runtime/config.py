@@ -119,11 +119,42 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "")
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
 
+# ── PPT slide-deck attachments ───────────────────────────────────────────
+# iCourse screenshots the desktop every 20-30 s while a lecture plays; the
+# PPT pipeline keeps only the dHash-deduplicated, non-garbage pages.  When
+# enabled, those survivors are stitched into one .pptx per lecture and sent
+# as an extra email attachment.
+PPT_EXPORT_ENABLED = (
+    os.environ.get("PPT_EXPORT_ENABLED", "1").strip().lower()
+    not in ("0", "false", "no", "")
+)
+# Upper bound on slides per deck (protects the email size / build time).
+PPT_EXPORT_MAX_SLIDES = int(os.environ.get("PPT_EXPORT_MAX_SLIDES", "300"))
+# Image budget for one deck; the exporter lowers resolution until it fits.
+PPT_EXPORT_MAX_MB = float(os.environ.get("PPT_EXPORT_MAX_MB", "15"))
+PPT_EXPORT_IMAGE_WIDTH = int(
+    os.environ.get("PPT_EXPORT_IMAGE_WIDTH", "1600")
+)
+PPT_EXPORT_JPEG_QUALITY = int(
+    os.environ.get("PPT_EXPORT_JPEG_QUALITY", "82")
+)
+# Concurrent slide-image downloads when a deck has to re-fetch pages that
+# were deduplicated in an earlier run (mirrors IMAGE_WORKERS for the OCR
+# prefetch pool; the images are small, so this is IO-bound).
+PPT_EXPORT_DOWNLOAD_WORKERS = int(
+    os.environ.get("PPT_EXPORT_DOWNLOAD_WORKERS", "16")
+)
+# Hard cap for all attachments of one email (QQ SMTP rejects oversized msgs).
+EMAIL_MAX_ATTACHMENT_MB = float(
+    os.environ.get("EMAIL_MAX_ATTACHMENT_MB", "40")
+)
+
 # Database & Storage
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 VIDEO_DIR = os.path.join(DATA_DIR, "videos")
 AUDIO_DIR = os.path.join(DATA_DIR, "audio")  # ffmpeg-decoded f32le scratch buffers
 DB_PATH = os.environ.get("DB_PATH", os.path.join(DATA_DIR, "icourse.db"))
+PPT_EXPORT_DIR = os.path.join(DATA_DIR, "ppt_export")
 
 # Sherpa-onnx ASR model directory.  Default: SenseVoice (zh+en+ja+ko+yue, int8).
 # ASR_MODEL_DIR is the new name; SENSEVOICE_MODEL_DIR is the legacy env var

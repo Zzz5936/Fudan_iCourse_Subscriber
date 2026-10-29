@@ -52,6 +52,62 @@ def fetch_ppt_image(client: "ICourseClient", item: dict,
     return None
 
 
+def download_ppt_image(client: "ICourseClient", item: dict,
+                       max_attempts: int = 5,
+                       timeout: int = 30) -> bytes | None:
+    """Robust PPT-screenshot download, modelled on the video/audio path.
+
+    The lecture MP4 download is resilient because ffmpeg reconnects and
+    ``download_lecture_media`` retries with a fresh signed URL; screenshots
+    need the same treatment when a deck has to be rebuilt from pages that
+    were deduplicated in an *earlier* run (their URLs may be hours old and
+    the WebVPN link can be flaky):
+
+      * streamed chunked read (never ``resp.content`` on a 20 MB HTML error
+        page),
+      * short-read detection against ``Content-Length``,
+      * exponential backoff between attempts.
+
+    Returns the raw image bytes, or ``None`` when every attempt failed.
+    """
+    url = (item.get("pptimgurl") or "").strip()
+    if not url:
+        return None
+    for attempt in range(1, max_attempts + 1):
+        resp = None
+        try:
+            if url.startswith(config.WEBVPN_BASE):
+                resp = client.vpn.get_raw(url, stream=True, timeout=timeout)
+            else:
+                resp = client.vpn.get(url, stream=True, timeout=timeout)
+            resp.raise_for_status()
+            expected = int(resp.headers.get("Content-Length") or 0)
+            buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    buf.extend(chunk)
+            if not buf:
+                raise RuntimeError("empty response body")
+            if expected and len(buf) < expected:
+                raise RuntimeError(
+                    f"short read: {len(buf)} of {expected} bytes"
+                )
+            return bytes(buf)
+        except Exception as e:                          # noqa: BLE001
+            print(f"[PPTFetcher] image retry {attempt}/{max_attempts} "
+                  f"(page {item.get('page_num')}): "
+                  f"{type(e).__name__}: {e}", flush=True)
+            if attempt < max_attempts:
+                time.sleep(min(0.5 * (2 ** (attempt - 1)), 4))
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+    return None
+
+
 class ICourseClient:
     """Client for the iCourse API, operating through WebVPN."""
 

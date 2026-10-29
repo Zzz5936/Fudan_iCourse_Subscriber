@@ -9,3 +9,4 @@ psutil
 pygments
 rapidocr-onnxruntime
 imagehash
+python-pptx
