@@ -67,6 +67,38 @@ def _check_session(client: ICourseClient) -> None:
     client._userinfo = None
 
 
+def _export_lecture_deck(client: ICourseClient, db: Database,
+                         sub_id: str, course_title: str,
+                         sub_title: str, date: str) -> str | None:
+    """Best-effort PPT deck export for one freshly summarised lecture.
+
+    Returns the generated .pptx path (to be attached to the email) or
+    ``None``.  Imported lazily: python-pptx is optional at runtime, so a
+    missing/broken install must not break the summary pipeline.
+    """
+    if not (config.PPT_EXPORT_ENABLED
+            and config.SMTP_EMAIL and config.SMTP_PASSWORD):
+        return None
+    try:
+        from src.pipeline.ppt_exporter import build_lecture_pptx
+        return build_lecture_pptx(
+            client, db, sub_id, course_title, sub_title, date,
+        )
+    except Exception as e:                              # noqa: BLE001
+        print(f"    [PPT] deck export skipped: {type(e).__name__}: {e}",
+              flush=True)
+        return None
+
+
+def _cleanup_ppt_exports() -> None:
+    """Drop generated decks (run start + after the email has gone out)."""
+    try:
+        from src.pipeline.ppt_exporter import cleanup_exports
+        cleanup_exports()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def _enumerate_lectures(client: ICourseClient, db: Database,
                         reporter: Reporter) -> list[tuple[str, str, dict]]:
     """Sync, fast: list every (course_id, course_title, lecture) we'll
@@ -178,13 +210,23 @@ def _drive_lectures(client: ICourseClient, db: Database,
                 course_id, course_title, lecture, next_info=next_info,
             )
             if summary:
-                email_items.append({
+                item = {
                     "sub_id": sub_id,
                     "course_title": course_title,
                     "sub_title": lecture.get("sub_title", sub_id),
                     "date": lecture.get("date", ""),
                     "summary": summary,
-                })
+                }
+                email_items.append(item)
+                # Build the slide deck after the summary succeeded: the PPT
+                # pipeline has finished by then, so the kept pages (and their
+                # OCR notes) are final for this lecture.
+                deck = _export_lecture_deck(
+                    client, db, sub_id, course_title,
+                    item["sub_title"], item["date"],
+                )
+                if deck:
+                    item["pptx_path"] = deck
         except Exception:
             reporter.lecture_error(sub_id)
             traceback.print_exc()
@@ -292,6 +334,8 @@ def run():
     """Single execution of the full pipeline."""
     reporter = Reporter()
     reporter.run_header()
+    # Decks are rebuilt per run; drop anything a previous crashed run left.
+    _cleanup_ppt_exports()
 
     if not config.COURSE_IDS and not config.CRAWL_TERM:
         reporter.info(
@@ -336,6 +380,7 @@ def run():
         scheduler.shutdown()
 
     _send_email(emailer, db, reporter, email_items)
+    _cleanup_ppt_exports()
     reporter.run_footer()
 
 

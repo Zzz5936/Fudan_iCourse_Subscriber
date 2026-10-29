@@ -49,6 +49,8 @@ from typing import TYPE_CHECKING
 from src.api import icourse
 from src.ai.ocr import ocr_image_text
 from src.ai.ppt_dedup import clean_ppt_text, compute_dhash, dedup_dhash, is_invalid_page, match_garbage
+from src.pipeline import ppt_slide_cache
+from src.runtime import config
 
 if TYPE_CHECKING:
     from src.data.database import Database
@@ -342,6 +344,17 @@ class PPTPipeline:
         for pn in dropped_pages:
             self._db.update_ppt_page(sub_id, pn, None, "dedup_dropped")
             images.pop(pn, None)
+
+        # Deck export: the survivors are downloaded, deduplicated and in
+        # memory right here — persist them now so the pptx builder can use
+        # the exact same bytes instead of hitting the CDN again later (the
+        # same "download once to disk, consume downstream" pattern the audio
+        # path uses with its f32le scratch file).
+        if images and config.PPT_EXPORT_ENABLED:
+            cached = ppt_slide_cache.save_pages(sub_id, images)
+            if cached:
+                print(f"    [PPT] cached {cached} deduplicated slide "
+                      f"screenshot(s) for the deck export", flush=True)
 
         return images, {
             "total": total, "inserted": inserted,

@@ -352,6 +352,24 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_ppt_export_pages(self, sub_id: str) -> list[dict]:
+        """Deduplicated pages worth exporting as slides (status='done').
+
+        ``get_done_ppt_pages`` is the bucketer's view and omits the image
+        URL on purpose; the slide-deck exporter needs ``pptimgurl`` so it
+        can re-fetch the screenshot.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT page_num, created_sec, pptimgurl, text
+                   FROM ppt_pages
+                   WHERE sub_id = ? AND ocr_status = 'done'
+                     AND pptimgurl IS NOT NULL AND pptimgurl != ''
+                   ORDER BY created_sec""",
+                (sub_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def count_pending_ppt_pages(self, sub_id: str) -> int:
         with self._lock:
             return self.conn.execute(
