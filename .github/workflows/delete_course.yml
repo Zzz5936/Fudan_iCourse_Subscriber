@@ -17,9 +17,7 @@ permissions:
   contents: write
 
 concurrency:
-  # Shared with check.yml / single_run.yml — every one of them force-pushes
-  # the same data branch, so they must not overlap.
-  group: icourse-data
+  group: db-reset
   cancel-in-progress: false
 
 jobs:

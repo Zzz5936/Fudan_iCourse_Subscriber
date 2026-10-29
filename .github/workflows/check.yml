@@ -10,14 +10,6 @@ on:
 permissions:
   contents: write
 
-# Serialise every workflow that mutates the data branch.  Two concurrent
-# runs both fetch the same database snapshot, both treat the same lectures
-# as pending (re-summarising and re-emailing them), and their forced pushes
-# race so the later one silently discards the earlier one's state.
-concurrency:
-  group: icourse-data
-  cancel-in-progress: false
-
 jobs:
   check:
     runs-on: ubuntu-latest
