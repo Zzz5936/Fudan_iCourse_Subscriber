@@ -2,13 +2,20 @@ name: iCourse Check
 
 on:
   schedule:
-    # Every day at 19:36 BTC (UTC + 8)
-    # 设计这个奇怪的时间是为了避免整点时的github队列峰值，避免排队过久。
-    - cron: "36 11 * * *"
+    # 每小时 :36 检查一次是否有新回放（iCourse 一般在课后不久放出录播）。
+    # 没有新回放时这次运行只做一次枚举就退出（约 2-4 分钟），
+    # 有新回放时同一次运行会自动完成下载/转写/总结并发送邮件。
+    - cron: "36 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# 每小时一次意味着运行可能重叠（例如首次回填会跑几小时）。两次运行会
+# 读到同一份 data 快照，重复总结、重复发信并互相覆盖 DB，所以必须串行。
+concurrency:
+  group: icourse-data
+  cancel-in-progress: false
 
 jobs:
   check:
