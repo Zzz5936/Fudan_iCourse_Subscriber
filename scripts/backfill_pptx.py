@@ -1,23 +1,31 @@
-"""Build slide decks for a course's past lectures.
+"""Build one course's archive: a single merged Markdown + all slide decks.
 
-The normal run only builds a deck for the lectures it summarises *in that run*
-(``main._drive_lectures``), so lectures summarised before the PPT pipeline
-existed never get one.  This script walks every lecture of one course, re-runs
-the PPT stages (fetch → dHash dedup → OCR) and writes
-``data/ppt_export/<sub_id>.pptx``; the workflow then hands that directory to
-``archive_run`` / the ``archive`` branch.
+Two entry points share the same data:
 
-Summaries are *not* produced here — it is a deck backfill.  Lectures that have
-no summary yet are reported and skipped; run the ``Single Run`` workflow for
-those first.
+* ``--print-meta`` resolves the course and prints what is already in the
+  database, so a workflow can name the branch and fetch its current content
+  before doing any expensive work.
+* the default mode walks the course's lectures and fills in only what is
+  missing (see "Reuse" below), writing the Markdown and the new decks to
+  ``--out-dir``.
 
-    python scripts/backfill_pptx.py --list
-    python scripts/backfill_pptx.py --course 数字逻辑
-    python scripts/backfill_pptx.py --course 30004 --limit 2
+Reuse — the point of this script is to avoid redoing work:
+
+* Markdown is rebuilt from the stored summaries; nothing is re-summarised.
+* A deck that already exists on the course branch (``--existing-dir``) is
+  skipped entirely — no PPT fetch, no OCR, no download.
+* Lectures whose ``ppt_pages`` are already OCR'd in the database skip the
+  PPT pipeline and go straight to deck assembly (only the slide images are
+  re-fetched, which is unavoidable for building a .pptx).
+
+    python scripts/backfill_pptx.py --course 数字逻辑 --print-meta
+    python scripts/backfill_pptx.py --course 数字逻辑 \
+        --existing-dir existing --out-dir course_out
 """
 
 import argparse
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -27,6 +35,9 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.database import Database  # noqa: E402
+from src.pipeline.archive import (  # noqa: E402
+    deck_filename, write_course_markdown,
+)
 from src.runtime.reporter import Reporter  # noqa: E402
 
 
@@ -80,6 +91,22 @@ def _resolve_course(db: Database, needle: str) -> dict:
     raise SystemExit(f"“{needle}”匹配到多门课，请改用 course_id：\n{listing}")
 
 
+def _coverage(db: Database, course_id: str) -> dict:
+    def one(sql: str) -> int:
+        return db.conn.execute(sql, (course_id,)).fetchone()[0]
+
+    return {
+        "lectures": one("SELECT COUNT(*) FROM lectures WHERE course_id = ?"),
+        "summarized": one(
+            "SELECT COUNT(*) FROM lectures"
+            " WHERE course_id = ? AND summary IS NOT NULL"),
+        "with_pages": one(
+            "SELECT COUNT(*) FROM lectures l WHERE l.course_id = ?"
+            " AND EXISTS (SELECT 1 FROM ppt_pages p WHERE p.sub_id = l.sub_id"
+            "             AND p.ocr_status = 'done')"),
+    }
+
+
 def _list_courses(db: Database) -> None:
     """Print every stored course with its coverage, so the caller can pick."""
     rows = db.conn.execute(
@@ -117,16 +144,32 @@ def _lectures_of(db: Database, course_id: str,
     return lectures
 
 
+def _existing_decks(directory: str) -> set[str]:
+    """Deck file names already present on the course branch."""
+    if not directory:
+        return set()
+    ppt_dir = os.path.join(directory, "ppt")
+    if not os.path.isdir(ppt_dir):
+        return set()
+    return {n for n in os.listdir(ppt_dir) if n.lower().endswith(".pptx")}
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill PPT decks.")
+    parser = argparse.ArgumentParser(description="Build a one-course archive.")
     parser.add_argument("--course", default="",
                         help="course_id or a unique fragment of the title")
     parser.add_argument("--list", action="store_true",
                         help="list stored courses and exit")
+    parser.add_argument("--print-meta", action="store_true",
+                        help="print course id/title/branch/coverage and exit")
     parser.add_argument("--sub-ids", default="",
                         help="comma-separated sub_ids to restrict the run")
     parser.add_argument("--limit", type=int, default=0,
                         help="stop after N lectures (0 = all)")
+    parser.add_argument("--existing-dir", default="",
+                        help="tree of the course branch (decks already built)")
+    parser.add_argument("--out-dir", default="",
+                        help="where to write the Markdown + new decks")
     args = parser.parse_args()
 
     db = Database()
@@ -137,27 +180,42 @@ def main() -> None:
 
     course = _resolve_course(db, args.course)
     course_id, course_title = course["course_id"], course["title"]
-    sub_ids = {s.strip() for s in args.sub_ids.split(",") if s.strip()}
+    coverage = _coverage(db, course_id)
 
+    if args.print_meta:
+        print(f"COURSE_ID={course_id}")
+        print(f"COURSE_TITLE={course_title}")
+        print(f"BRANCH=course-{course_id}")
+        print(f"LECTURES={coverage['lectures']}")
+        print(f"SUMMARIZED={coverage['summarized']}")
+        print(f"WITH_PAGES={coverage['with_pages']}")
+        return
+
+    sub_ids = {s.strip() for s in args.sub_ids.split(",") if s.strip()}
     lectures = _lectures_of(db, course_id, sub_ids or None)
     if not lectures:
         raise SystemExit(f"{course_title} 没有匹配的讲次")
     if args.limit > 0:
         lectures = lectures[:args.limit]
 
-    pending = [l for l in lectures if not l["summary"]]
-    if pending:
-        print(f"[Warn] {len(pending)}/{len(lectures)} 讲还没有总结"
-              f"（如 {pending[0]['sub_id']}）——先跑 Single Run 补齐，"
-              f"本次只生成已有总结讲次的课件。", flush=True)
+    if coverage["summarized"] < coverage["lectures"]:
+        print(f"[Warn] {course_title} 有 "
+              f"{coverage['lectures'] - coverage['summarized']} 讲还没总结；"
+              f"先跑 Single Run 补齐，否则 md 会缺这些讲次。", flush=True)
+
+    existing = _existing_decks(args.existing_dir)
+    if existing:
+        print(f"[Reuse] 分支上已有 {len(existing)} 份课件，将跳过重建",
+              flush=True)
 
     reporter = Reporter()
     reporter.run_header()
 
-    # Imported here so `--list` works without the network / OCR stack.
+    # Imported here so `--list` / `--print-meta` work without the network and
+    # OCR stack installed.
     from src.api.icourse import ICourseClient
-    from src.pipeline.ppt_pipeline import PPTPipeline
     from src.pipeline.ppt_exporter import build_lecture_pptx
+    from src.pipeline.ppt_pipeline import PPTPipeline
     from src.runtime.scheduler import Scheduler
 
     vpn = _login()
@@ -165,11 +223,24 @@ def main() -> None:
     scheduler = Scheduler(reporter=reporter)
     pipeline = PPTPipeline(db, scheduler, reporter)
 
-    built = empty = failed = 0
+    out_ppt_dir = os.path.join(args.out_dir, "ppt") if args.out_dir else ""
+    if out_ppt_dir:
+        os.makedirs(out_ppt_dir, exist_ok=True)
+
+    built = empty = failed = skipped = reused = 0
     t0 = time.time()
     try:
         for i, lec in enumerate(lectures, 1):
             sub_id = str(lec["sub_id"])
+            dest_name = deck_filename(course_title, lec.get("date") or "",
+                                      sub_id)
+
+            if dest_name in existing:
+                skipped += 1
+                print(f"\n[{i}/{len(lectures)}] {sub_id} 已有课件，跳过",
+                      flush=True)
+                continue
+
             print(f"\n[{i}/{len(lectures)}] {course_title} · "
                   f"{lec['sub_title']} ({lec['date']})", flush=True)
             try:
@@ -178,8 +249,14 @@ def main() -> None:
                     client.vpn = _login()
                     client._userinfo = None
 
-                handle = pipeline.submit(client, course_id, sub_id)
-                stats = handle.drain()
+                # Pages already OCR'd in the database: skip fetch/dedup/OCR.
+                if db.get_ppt_export_pages(sub_id):
+                    reused += 1
+                    print("  复用数据库里已处理的幻灯片页面", flush=True)
+                else:
+                    handle = pipeline.submit(client, course_id, sub_id)
+                    handle.drain()
+
                 deck = build_lecture_pptx(
                     client, db, sub_id, course_title,
                     lec.get("sub_title") or sub_id, lec.get("date") or "",
@@ -187,23 +264,33 @@ def main() -> None:
                 )
                 if deck:
                     built += 1
-                    print(f"  → {deck}", flush=True)
+                    if out_ppt_dir:
+                        shutil.copyfile(deck, os.path.join(out_ppt_dir,
+                                                          dest_name))
+                    print(f"  → {dest_name}", flush=True)
                 else:
                     empty += 1
-                    print(f"  → 没有可导出的课件（保留页面 {stats.done}）",
-                          flush=True)
+                    print("  → 没有可导出的课件", flush=True)
             except Exception:                           # noqa: BLE001
                 failed += 1
-                print(f"  → 失败：", flush=True)
+                print("  → 失败：", flush=True)
                 traceback.print_exc()
             finally:
                 scheduler.image_cache.discard(sub_id)
     finally:
         scheduler.shutdown()
 
+    md = {"filename": "-", "lecture_count": 0}
+    if args.out_dir:
+        md = write_course_markdown(db, course_id, args.out_dir)
+
     elapsed = time.time() - t0
-    print(f"\n[Done] {course_title}: 生成 {built}，无课件 {empty}，失败 {failed}，"
+    print(f"\n[Done] {course_title}: 新建 {built}，跳过 {skipped}（分支已有），"
+          f"复用 OCR {reused}，无课件 {empty}，失败 {failed}，"
           f"耗时 {elapsed / 60:.1f} 分钟", flush=True)
+    if args.out_dir:
+        print(f"[Done] {md['filename']}（{md['lecture_count']} 讲）→ "
+              f"{args.out_dir}", flush=True)
     if failed:
         sys.exit(1)
 
