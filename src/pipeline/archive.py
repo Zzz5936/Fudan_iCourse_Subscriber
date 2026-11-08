@@ -45,8 +45,8 @@ def _safe_filename(title: str) -> str:
     )[:80]
 
 
-def _build_course_markdown(course_title: str, teacher: str,
-                           lectures: list[dict]) -> str:
+def build_course_markdown(course_title: str, teacher: str,
+                          lectures: list[dict]) -> str:
     """Render one course's lectures into a single Markdown document.
 
     Layout mirrors ``scripts/export_course.py::_build_plain`` so an archived
@@ -79,6 +79,39 @@ def _reset_markdown_dir() -> None:
             os.remove(os.path.join(MD_DIR, name))
 
 
+def course_lectures(db, course_id: str) -> list[dict]:
+    """Every summarised lecture of one course, in lecture order."""
+    rows = db.conn.execute(
+        """SELECT sub_id, sub_title, date, summary FROM lectures
+            WHERE course_id = ? AND summary IS NOT NULL
+            ORDER BY CAST(sub_id AS INTEGER) ASC""",
+        (course_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def write_course_markdown(db, course_id: str, out_dir: str) -> dict:
+    """Write ``<out_dir>/<课程>_全讲次.md`` for a single course.
+
+    Same document the ``archive`` branch gets, scoped to one course so the
+    per-course branch can hold it at its root.
+    """
+    course = db.conn.execute(
+        "SELECT title, teacher FROM courses WHERE course_id = ?", (course_id,)
+    ).fetchone()
+    if not course:
+        raise SystemExit(f"course_id {course_id} not in database")
+    title = course["title"] or course_id
+    lectures = course_lectures(db, course_id)
+    os.makedirs(out_dir, exist_ok=True)
+    filename = f"{_safe_filename(title)}_全讲次.md"
+    with open(os.path.join(out_dir, filename), "w", encoding="utf-8") as fh:
+        fh.write(build_course_markdown(title, course["teacher"] or "",
+                                       lectures))
+    return {"title": title, "filename": filename,
+            "lecture_count": len(lectures)}
+
+
 def _export_course_markdown(db) -> list[dict]:
     """Write one merged Markdown file per course; return per-course stats."""
     courses = db.conn.execute(
@@ -94,29 +127,21 @@ def _export_course_markdown(db) -> list[dict]:
     for course in courses:
         if not course["lecture_count"]:
             continue
-        rows = db.conn.execute(
-            """SELECT sub_id, sub_title, date, summary FROM lectures
-                WHERE course_id = ? AND summary IS NOT NULL
-                ORDER BY CAST(sub_id AS INTEGER) ASC""",
-            (course["course_id"],),
-        ).fetchall()
+        rows = course_lectures(db, course["course_id"])
         title = course["title"] or course["course_id"]
         filename = f"{_safe_filename(title)}_全讲次.md"
-        body = _build_course_markdown(
-            title, course["teacher"] or "", [dict(r) for r in rows],
-        )
+        body = build_course_markdown(title, course["teacher"] or "", rows)
         with open(os.path.join(MD_DIR, filename), "w", encoding="utf-8") as fh:
             fh.write(body)
         exported.append({
             "title": title,
             "filename": filename,
             "lecture_count": len(rows),
-            "deck_count": 0,
         })
     return exported
 
 
-def _deck_filename(course_title: str, date: str, sub_id: str) -> str:
+def deck_filename(course_title: str, date: str, sub_id: str) -> str:
     parts = [_safe_filename(course_title)]
     if date:
         parts.append(_safe_filename(date))
@@ -161,30 +186,33 @@ def _copy_decks(db) -> tuple[dict[str, int], int]:
             skipped += 1
             continue
         course_title = row["title"] or ""
-        dest_name = _deck_filename(course_title, row["date"] or "", sub_id)
+        dest_name = deck_filename(course_title, row["date"] or "", sub_id)
         shutil.copyfile(src_path, os.path.join(PPT_DIR, dest_name))
         counts[course_title] = counts.get(course_title, 0) + 1
     return counts, skipped
 
 
 def _write_index(courses: list[dict]) -> None:
-    """Write a small table of contents so the branch is browsable."""
+    """Write a small table of contents so the branch is browsable.
+
+    Deck counts are deliberately left out: ``archive/ppt`` accumulates across
+    runs (the deploy step overlays it), so this run only knows about the decks
+    it built, not the ones already on the branch.
+    """
     lines = [
         "# 课程归档",
         "",
-        "每门课一份汇总 Markdown（全部讲次，按讲次顺序），所有课件集中放在 "
-        "`ppt/`，文件名含课程名与日期。",
+        "每门课一份汇总 Markdown（全部讲次，按讲次顺序）。所有课件集中放在 "
+        "[ppt/](ppt/)，文件名含课程名与日期。",
         "",
     ]
     for course in courses:
         lines.append(f"## {course['title']}")
         lines.append("")
         lines.append(
-            f"- 汇总：[{course['filename']}](md/{course['filename']})"
+            f"- [{course['filename']}](md/{course['filename']})"
             f"（{course['lecture_count']} 讲）"
         )
-        if course["deck_count"]:
-            lines.append(f"- 课件：{course['deck_count']} 份（[ppt/](ppt/)）")
         lines.append("")
     with open(os.path.join(ARCHIVE_DIR, "index.md"), "w",
               encoding="utf-8") as fh:
@@ -202,13 +230,11 @@ def archive_run(db) -> dict:
     _reset_markdown_dir()
     courses = _export_course_markdown(db)
     decks_by_course, skipped = _copy_decks(db)
-    for course in courses:
-        course["deck_count"] = decks_by_course.get(course["title"], 0)
     _write_index(courses)
     return {
         "dir": ARCHIVE_DIR,
         "courses": len(courses),
         "lectures": sum(c["lecture_count"] for c in courses),
-        "decks": sum(c["deck_count"] for c in courses),
+        "decks": sum(decks_by_course.values()),
         "skipped_decks": skipped,
     }

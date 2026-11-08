@@ -1,0 +1,218 @@
+name: Course Archive
+
+# Builds a dedicated branch per course: every lecture summary in one Markdown
+# plus all slide decks in one folder.  Only work that is actually missing is
+# done — summaries come from the database, decks already on the branch are
+# skipped, and lectures whose slides were already OCR'd skip the PPT pipeline.
+on:
+  workflow_dispatch:
+    inputs:
+      course:
+        description: "课程名或 course_id（如 数字逻辑 或 30004）；留空则只列出课程清单"
+        required: false
+        type: string
+        default: ""
+      sub_ids:
+        description: "可选：只处理这些讲次，逗号分隔（留空 = 该课程全部讲次）"
+        required: false
+        type: string
+        default: ""
+      limit:
+        description: "可选：最多处理几讲（0 = 全部；先用 2 试跑最稳）"
+        required: false
+        type: string
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Python packages
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.pythonLocation }}/lib/python*/site-packages
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        if: steps.cache-pip.outputs.cache-hit != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Cache RapidOCR models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/rapidocr
+          key: rapidocr-onnx-default-v1
+
+      - name: Fetch database from data branch
+        if: inputs.course != ''
+        run: |
+          mkdir -p data
+          git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" 2>/dev/null \
+            || { echo "No data branch, starting fresh."; exit 0; }
+          git ls-tree origin/data --name-only data/ | grep -q . \
+            || { echo "No database found on data branch, starting fresh."; exit 0; }
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            mkdir -p data/sharded/shards
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
+          elif git cat-file -e origin/data:data/icourse.db.gz.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
+            echo "Loaded legacy compressed database."
+          elif git cat-file -e origin/data:data/icourse.db.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
+            echo "Loaded legacy uncompressed database."
+          else
+            echo "No database found on data branch, starting fresh."
+          fi
+
+      - name: Decode database
+        if: inputs.course != '' && hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ -f data/sharded/icourse-index.enc ]; then
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+            echo "Reassembled sharded database."
+            exit 0
+          fi
+
+          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
+          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
+
+          decrypt_blob() {
+            local in_path="$1"
+            local out_path="$2"
+            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
+                 -in "$in_path" -out "$out_path" \
+                 -pass pass:"$NEW_KEY" 2>/dev/null; then
+              echo "v2"
+              return 0
+            fi
+            if openssl enc -aes-256-cbc -d -pbkdf2 \
+                 -in "$in_path" -out "$out_path" \
+                 -pass pass:"$LEGACY_KEY" 2>/dev/null; then
+              echo "legacy"
+              return 0
+            fi
+            return 1
+          }
+
+          if [ -f data/icourse.db.gz.enc ]; then
+            if VER=$(decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz); then
+              gzip -d data/icourse.db.gz
+              echo "Legacy compressed DB decrypted ($VER)."
+            else
+              echo "::warning::Decryption failed (both keys). Starting with fresh database."
+              rm -f data/icourse.db data/icourse.db.gz
+            fi
+          elif [ -f data/icourse.db.enc ]; then
+            if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
+              echo "Legacy uncompressed DB decrypted ($VER)."
+            else
+              echo "::warning::Decryption failed (both keys). Starting with fresh database."
+              rm -f data/icourse.db
+            fi
+          fi
+
+      - name: List courses
+        if: inputs.course == ''
+        run: python -u scripts/backfill_pptx.py --list
+
+      - name: Resolve course
+        if: inputs.course != ''
+        id: meta
+        run: |
+          OUT=$(python -u scripts/backfill_pptx.py --course "${{ inputs.course }}" --print-meta)
+          echo "$OUT"
+          echo "$OUT" | sed -n 's/^BRANCH=/branch=/p' >> "$GITHUB_OUTPUT"
+          echo "$OUT" | sed -n 's/^COURSE_TITLE=/title=/p' >> "$GITHUB_OUTPUT"
+
+      - name: Fetch existing course branch
+        if: inputs.course != ''
+        run: |
+          BRANCH="${{ steps.meta.outputs.branch }}"
+          if git fetch --depth=1 origin "$BRANCH" 2>/dev/null; then
+            mkdir -p existing
+            git archive FETCH_HEAD | tar -x -C existing
+            echo "Existing decks: $(ls existing/ppt 2>/dev/null | wc -l)"
+          else
+            echo "Branch $BRANCH does not exist yet."
+          fi
+
+      - name: Build Markdown + missing decks
+        if: inputs.course != ''
+        timeout-minutes: 200
+        env:
+          StuId: ${{ secrets.STUID }}
+          UISPsw: ${{ secrets.UISPSW }}
+        run: |
+          python -u scripts/backfill_pptx.py \
+            --course "${{ inputs.course }}" \
+            --sub-ids "${{ inputs.sub_ids }}" \
+            --limit "${{ inputs.limit }}" \
+            --existing-dir existing \
+            --out-dir course_out
+
+      - name: Deploy to course branch
+        if: always() && inputs.course != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -d course_out ]; then
+            echo "No output, skipping."
+            exit 0
+          fi
+
+          BRANCH="${{ steps.meta.outputs.branch }}"
+          DEPLOY_DIR=/tmp/course_deploy
+          rm -rf "$DEPLOY_DIR"
+          git init -q "$DEPLOY_DIR"
+          cd "$DEPLOY_DIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+
+          if git fetch -q --depth=1 origin "$BRANCH" 2>/dev/null; then
+            git checkout -q -b "$BRANCH" FETCH_HEAD
+          else
+            echo "Creating $BRANCH."
+            git checkout -q --orphan "$BRANCH"
+          fi
+
+          # The branch holds exactly one Markdown at its root plus ppt/.  The
+          # Markdown is rewritten from the database every run (a title change
+          # renames the file), the decks accumulate.
+          rm -f ./*.md
+          mkdir -p ppt
+          cp -a "${GITHUB_WORKSPACE}/course_out/"*.md .
+          if [ -d "${GITHUB_WORKSPACE}/course_out/ppt" ]; then
+            cp -a "${GITHUB_WORKSPACE}/course_out/ppt/." ppt/
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Branch unchanged, nothing to push."
+            exit 0
+          fi
+          git commit -q -m "chore: archive ${{ steps.meta.outputs.title }}"
+          git push -q origin "$BRANCH"
