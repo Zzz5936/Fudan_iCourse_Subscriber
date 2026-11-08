@@ -217,11 +217,19 @@ jobs:
             git checkout -q --orphan archive
           fi
 
-          # The tree is rebuilt from the database every run, so replace it
-          # wholesale: a lecture re-summarised into new text must not leave
-          # the previous version behind.
-          rm -rf archive
-          cp -a "${GITHUB_WORKSPACE}/archive" ./archive
+          # md/ and index.md are rebuilt from the database on every run, so
+          # replace them outright: a lecture re-summarised into new text must
+          # not leave the previous version behind.  ppt/ accumulates instead —
+          # overwrite decks by name, keep everything earlier runs produced.
+          rm -rf archive/md archive/index.md
+          mkdir -p archive/ppt
+          if [ -d "${GITHUB_WORKSPACE}/archive/md" ]; then
+            cp -a "${GITHUB_WORKSPACE}/archive/md" archive/md
+            cp -a "${GITHUB_WORKSPACE}/archive/index.md" archive/index.md
+          fi
+          if [ -d "${GITHUB_WORKSPACE}/archive/ppt" ]; then
+            cp -a "${GITHUB_WORKSPACE}/archive/ppt/." archive/ppt/
+          fi
           git add -A
           if git diff --cached --quiet; then
             echo "Archive unchanged, nothing to push."

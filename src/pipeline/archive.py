@@ -111,7 +111,6 @@ def _export_course_markdown(db) -> list[dict]:
             "title": title,
             "filename": filename,
             "lecture_count": len(rows),
-            "deck_count": 0,
         })
     return exported
 
@@ -168,23 +167,26 @@ def _copy_decks(db) -> tuple[dict[str, int], int]:
 
 
 def _write_index(courses: list[dict]) -> None:
-    """Write a small table of contents so the branch is browsable."""
+    """Write a small table of contents so the branch is browsable.
+
+    Deck counts are deliberately left out: ``archive/ppt`` accumulates across
+    runs (the deploy step overlays it), so this run only knows about the decks
+    it built, not the ones already on the branch.
+    """
     lines = [
         "# 课程归档",
         "",
-        "每门课一份汇总 Markdown（全部讲次，按讲次顺序），所有课件集中放在 "
-        "`ppt/`，文件名含课程名与日期。",
+        "每门课一份汇总 Markdown（全部讲次，按讲次顺序）。所有课件集中放在 "
+        "[ppt/](ppt/)，文件名含课程名与日期。",
         "",
     ]
     for course in courses:
         lines.append(f"## {course['title']}")
         lines.append("")
         lines.append(
-            f"- 汇总：[{course['filename']}](md/{course['filename']})"
+            f"- [{course['filename']}](md/{course['filename']})"
             f"（{course['lecture_count']} 讲）"
         )
-        if course["deck_count"]:
-            lines.append(f"- 课件：{course['deck_count']} 份（[ppt/](ppt/)）")
         lines.append("")
     with open(os.path.join(ARCHIVE_DIR, "index.md"), "w",
               encoding="utf-8") as fh:
@@ -202,13 +204,11 @@ def archive_run(db) -> dict:
     _reset_markdown_dir()
     courses = _export_course_markdown(db)
     decks_by_course, skipped = _copy_decks(db)
-    for course in courses:
-        course["deck_count"] = decks_by_course.get(course["title"], 0)
     _write_index(courses)
     return {
         "dir": ARCHIVE_DIR,
         "courses": len(courses),
         "lectures": sum(c["lecture_count"] for c in courses),
-        "decks": sum(c["deck_count"] for c in courses),
+        "decks": sum(decks_by_course.values()),
         "skipped_decks": skipped,
     }
