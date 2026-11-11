@@ -166,6 +166,7 @@ jobs:
         env:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
+          UIS_TOTP_SECRET: ${{ secrets.UIS_TOTP_SECRET }}
         run: |
           python -u scripts/backfill_pptx.py \
             --course "${{ inputs.course }}" \
