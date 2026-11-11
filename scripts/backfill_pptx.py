@@ -44,7 +44,7 @@ from src.runtime.reporter import Reporter  # noqa: E402
 def _login(max_attempts: int = 5):
     """Log in to WebVPN + iCourse CAS, the same way ``main.login_with_retry``
     does (kept local so the script does not import the ASR stack)."""
-    from src.api.webvpn import WebVPNSession
+    from src.api.webvpn import SecondFactorError, WebVPNSession
 
     for attempt in range(max_attempts):
         try:
@@ -55,6 +55,9 @@ def _login(max_attempts: int = 5):
             print("[Login] iCourse CAS...", flush=True)
             vpn.authenticate_icourse()
             return vpn
+        except SecondFactorError:
+            vpn.session.close()
+            raise
         except Exception as e:                          # noqa: BLE001
             print(f"  Failed: {type(e).__name__}: {e}", flush=True)
             if attempt == max_attempts - 1:
